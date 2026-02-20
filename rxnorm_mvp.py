@@ -37,6 +37,7 @@ RATIO_STRENGTH_RE = re.compile(
     r"\b(\d+(?:\.\d+)?)\s*(?:[-/]|to|\s+)\s*(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml|units?|meq|%)\b"
 )
 SINGLE_STRENGTH_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml|units?|meq|%)\b")
+SLASH_RATIO_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\b")
 
 CONTEXT_STOPWORDS: Set[str] = {
     "po",
@@ -980,6 +981,44 @@ def add_strength_signature(signatures: Set[str], value: str, unit: str) -> None:
         signatures.add(f"{canonical_number(str(mg_value))}mg")
 
 
+def unit_to_mg(value: float, unit: str) -> Optional[float]:
+    lowered = unit.lower()
+    if lowered == "mg":
+        return value
+    if lowered == "mcg":
+        return value / 1000.0
+    if lowered == "g":
+        return value * 1000.0
+    return None
+
+
+def extract_candidate_strengths_mg(candidate_name: str) -> List[float]:
+    values: List[float] = []
+    for raw_value, raw_unit in SINGLE_STRENGTH_RE.findall(candidate_name.lower()):
+        try:
+            numeric = float(raw_value)
+        except ValueError:
+            continue
+        mg_value = unit_to_mg(numeric, raw_unit)
+        if mg_value is None:
+            continue
+        values.append(mg_value)
+    deduped = sorted({round(v, 6) for v in values})
+    return deduped
+
+
+def ratio_pair_candidates_mg(first: float, second: float) -> List[Tuple[float, float]]:
+    pairs: List[Tuple[float, float]] = [(first, second)]
+    if first >= 10.0 and second >= 10.0:
+        pairs.append((first / 1000.0, second / 1000.0))
+    return pairs
+
+
+def contains_close_value(values: Sequence[float], expected: float) -> bool:
+    tolerance = max(0.005, abs(expected) * 0.06)
+    return any(abs(v - expected) <= tolerance for v in values)
+
+
 def collapse_spelled_letters(text: str) -> str:
     tokens = text.split()
     if not tokens:
@@ -1153,11 +1192,26 @@ def extract_mention_features(
         or " and " in f" {mention_norm} "
         or " with " in f" {mention_norm} "
     )
+    ratio_pairs: List[Tuple[float, float]] = []
+    ascii_mention = (
+        unicodedata.normalize("NFKD", mention_text).encode("ascii", "ignore").decode("ascii")
+    )
+    for first_raw, second_raw in SLASH_RATIO_RE.findall(ascii_mention.lower()):
+        try:
+            first_val = float(first_raw)
+            second_val = float(second_raw)
+        except ValueError:
+            continue
+        if first_val <= 0.0 or second_val <= 0.0:
+            continue
+        ratio_pairs.append((first_val, second_val))
+
     return {
         "strength_tokens": strength_tokens,
         "strength_sigs": strength_sigs,
         "form_tokens": form_tokens,
         "combo_hint": combo_hint,
+        "ratio_pairs": ratio_pairs,
     }
 
 
@@ -1342,6 +1396,7 @@ def score_tty_candidate(
 
     strength_tokens = mention_features["strength_tokens"]  # type: ignore[assignment]
     strength_sigs = mention_features["strength_sigs"]  # type: ignore[assignment]
+    ratio_pairs = mention_features.get("ratio_pairs", [])
     form_tokens = mention_features["form_tokens"]  # type: ignore[assignment]
     combo_hint = bool(mention_features["combo_hint"])
 
@@ -1362,6 +1417,27 @@ def score_tty_candidate(
                 score -= 1.4
         else:
             score -= 0.8
+
+    if isinstance(ratio_pairs, list) and ratio_pairs:
+        candidate_strengths_mg = extract_candidate_strengths_mg(candidate_name)
+        matched_ratio = False
+        if len(candidate_strengths_mg) >= 2:
+            for first_val, second_val in ratio_pairs:
+                pair_matched = False
+                for cand_first, cand_second in ratio_pair_candidates_mg(first_val, second_val):
+                    first_ok = contains_close_value(candidate_strengths_mg, cand_first)
+                    second_ok = contains_close_value(candidate_strengths_mg, cand_second)
+                    if first_ok and second_ok:
+                        pair_matched = True
+                        break
+                if pair_matched:
+                    matched_ratio = True
+                    break
+
+        if matched_ratio:
+            score += 3.4
+        elif len(candidate_strengths_mg) >= 2:
+            score -= 1.3
 
     if isinstance(form_tokens, set) and form_tokens:
         candidate_flags = candidate_form_flags(candidate_norm)

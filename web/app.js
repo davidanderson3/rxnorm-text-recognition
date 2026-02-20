@@ -116,6 +116,7 @@ function dedupeMentionsForDisplay(mentions) {
 }
 
 function ttyLine(label, item) {
+  if (!item) return "";
   return `<div class="tty-line"><span class="tty-label">${label}</span> ${escapeHtml(cellValue(item))}</div>`;
 }
 
@@ -129,12 +130,16 @@ function renderResults(payload) {
     resultList.innerHTML = displayMentions
       .map((m) => {
         const t = m.tty_results || {};
-        const ttyRows = ttyOrder.map((label) => ttyLine(label, t[label])).join("");
+        const ttyRows = ttyOrder
+          .map((label) => ttyLine(label, t[label]))
+          .filter(Boolean)
+          .join("");
+        const ttySection = ttyRows ? `<div class="tty-list">${ttyRows}</div>` : "";
         return `
           <article class="result-item">
             <strong>${escapeHtml(m.mention_text || "")}</strong>
             <small>${escapeHtml(m.normalized_text || "")}</small>
-            <div class="tty-list">${ttyRows}</div>
+            ${ttySection}
           </article>
         `;
       })
