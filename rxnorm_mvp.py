@@ -657,15 +657,10 @@ def detect_mentions(
                 mention["mention_end"] = int(mention["end"])
                 continue
 
-            if line_counts[(line_start, line_end)] == 1:
-                left_trim = len(line_raw) - len(line_raw.lstrip())
-                mention["mention_text"] = line_stripped
-                mention["mention_start"] = line_start + left_trim
-                mention["mention_end"] = line_start + left_trim + len(line_stripped)
-            else:
-                mention["mention_text"] = str(mention["text"])
-                mention["mention_start"] = int(mention["start"])
-                mention["mention_end"] = int(mention["end"])
+            left_trim = len(line_raw) - len(line_raw.lstrip())
+            mention["mention_text"] = line_stripped
+            mention["mention_start"] = line_start + left_trim
+            mention["mention_end"] = line_start + left_trim + len(line_stripped)
         return mentions
 
     chunks = [chunk.strip() for chunk in re.split(r"[;\n]+", text) if chunk.strip()]
@@ -804,6 +799,76 @@ def extract_mention_features(
         "form_tokens": form_tokens,
         "combo_hint": combo_hint,
     }
+
+
+def get_line_bounds(text: str, start: int, end: int) -> Tuple[int, int]:
+    line_start = text.rfind("\n", 0, start)
+    line_start = 0 if line_start < 0 else line_start + 1
+    line_end = text.find("\n", end)
+    line_end = len(text) if line_end < 0 else line_end
+    return line_start, line_end
+
+
+def clause_around_span(line_text: str, rel_start: int, rel_end: int) -> str:
+    left_candidates = [line_text.rfind(ch, 0, rel_start) for ch in ".;:!?"]
+    left_bound = max(left_candidates) if left_candidates else -1
+    right_candidates = [line_text.find(ch, rel_end) for ch in ".;:!?"]
+    right_candidates = [pos for pos in right_candidates if pos >= 0]
+    right_bound = min(right_candidates) if right_candidates else len(line_text)
+    return line_text[left_bound + 1 : right_bound].strip()
+
+
+def is_negated_mention(
+    full_text: str, span_start: int, span_end: int, mention_norm: str
+) -> bool:
+    line_start, line_end = get_line_bounds(full_text, span_start, span_end)
+    line_text = full_text[line_start:line_end]
+    rel_start = max(0, span_start - line_start)
+    rel_end = max(rel_start, span_end - line_start)
+    clause = clause_around_span(line_text, rel_start, rel_end)
+    clause_norm = normalize_text(clause)
+    if not clause_norm:
+        return False
+
+    tokens = mention_norm.split()
+    if not tokens:
+        return False
+    anchor = re.escape(tokens[0])
+    neg_pattern = (
+        rf"\b(?:no|denies|deny|denied|without|not taking|not on|off|hold|held|stop|"
+        rf"stopped|discontinue|discontinued|allergic to|allergy to)\b"
+        rf"(?:\s+\w+){{0,8}}\s+\b{anchor}\b"
+    )
+    if re.search(neg_pattern, clause_norm):
+        return True
+
+    post_neg_pattern = rf"\b{anchor}\b(?:\s+\w+){{0,6}}\s+\b(?:held|stopped|discontinued)\b"
+    return bool(re.search(post_neg_pattern, clause_norm))
+
+
+def has_brand_evidence(
+    conn: sqlite3.Connection,
+    mention_text: str,
+    exact_ttys: Sequence[str],
+    best_tty: Optional[str],
+) -> bool:
+    if best_tty in {"BN", "SBD", "BPCK"}:
+        return True
+    if any(tty in {"BN", "SBD", "BPCK"} for tty in exact_ttys):
+        return True
+
+    chunks = re.findall(r"[\(\[]([^)\]]{2,60})[\)\]]", mention_text)
+    for chunk in chunks:
+        norm_chunk = normalize_text(chunk)
+        if not norm_chunk:
+            continue
+        row = conn.execute(
+            "SELECT 1 FROM alias WHERE norm_text = ? AND tty = 'BN' LIMIT 1",
+            (norm_chunk,),
+        ).fetchone()
+        if row:
+            return True
+    return False
 
 
 def collect_tty_candidates(
@@ -1097,14 +1162,14 @@ def cmd_infer(args: argparse.Namespace) -> int:
         ingredient_cache: Dict[str, Set[str]] = {}
 
         for mention in mentions:
-            mention_text = str(mention["text"])
+            mention_text = str(mention.get("mention_text", mention["text"]))
             mention_norm = str(mention["norm_text"])
-            mention_start = int(mention["start"])
-            mention_end = int(mention["end"])
-            line_start = input_text.rfind("\n", 0, mention_start)
-            line_start = 0 if line_start < 0 else line_start + 1
-            line_end = input_text.find("\n", mention_end)
-            line_end = len(input_text) if line_end < 0 else line_end
+            matched_text = str(mention["text"])
+            mention_start = int(mention.get("mention_start", mention["start"]))
+            mention_end = int(mention.get("mention_end", mention["end"]))
+            match_start = int(mention["start"])
+            match_end = int(mention["end"])
+            line_start, line_end = get_line_bounds(input_text, mention_start, mention_end)
             line_context = input_text[line_start:line_end].strip()
             if len(line_context) < 4:
                 context_start = max(0, mention_start - 24)
@@ -1112,6 +1177,16 @@ def cmd_infer(args: argparse.Namespace) -> int:
                 line_context = input_text[context_start:context_end]
             mention_context_norm = normalize_text(line_context)
             exact_rxcuids: List[str] = list(mention["exact_rxcuids"])  # type: ignore[assignment]
+            exact_ttys: List[str] = list(mention.get("exact_ttys", []))  # type: ignore[assignment]
+
+            if is_negated_mention(
+                full_text=input_text,
+                span_start=match_start,
+                span_end=match_end,
+                mention_norm=mention_norm,
+            ):
+                continue
+
             score_by_rxcui: Dict[str, float] = {}
 
             for rxcui, score in top_embedding_candidates(
@@ -1142,13 +1217,28 @@ def cmd_infer(args: argparse.Namespace) -> int:
                 candidate_cache=candidate_cache,
                 ingredient_cache=ingredient_cache,
             )
+            brand_present = has_brand_evidence(
+                conn=conn,
+                mention_text=mention_text,
+                exact_ttys=exact_ttys,
+                best_tty=best_tty,
+            )
+            if not brand_present:
+                projected["BN"] = None
+                projected["SBD"] = None
+                projected["BPCK"] = None
 
             results.append(
                 {
                     "mention_text": mention_text,
+                    "matched_text": matched_text,
                     "span": {
                         "start": mention_start,
                         "end": mention_end,
+                    },
+                    "matched_span": {
+                        "start": match_start,
+                        "end": match_end,
                     },
                     "normalized_text": mention_norm,
                     "best_match": {

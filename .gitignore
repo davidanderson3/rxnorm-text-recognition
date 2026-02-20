@@ -1,8 +1,9 @@
 RxNorm_full_prescribe_current.zip
 artifacts
-RxNorm_full_prescribe_current
 __pycache__/
 *.py[cod]
 .pycache_local/
-
 .zsh_history
+RxNorm_full_prescribe_current/Readme_Full_Prescribe_02022026.txt
+.gitignore
+RxNorm_full_prescribe_current/scripts
