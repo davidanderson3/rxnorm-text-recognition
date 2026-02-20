@@ -1,0 +1,265 @@
+const DEFAULT_CONFIG = {
+  pyodideIndexURL: "https://cdn.jsdelivr.net/pyodide/v0.27.3/full/",
+  artifactsBaseUrl: "../artifacts/rxnorm_mvp",
+  mvpScriptUrl: "../rxnorm_mvp.py",
+  inferOptions: {
+    top_k: 40,
+    exact_boost: 0.35,
+    max_graph_depth: 3,
+    max_ngram: 8,
+    max_exact_candidates: 25,
+  },
+};
+
+const userConfig = window.RXNORM_WEB_CONFIG || {};
+const CONFIG = {
+  ...DEFAULT_CONFIG,
+  ...userConfig,
+  inferOptions: {
+    ...DEFAULT_CONFIG.inferOptions,
+    ...(userConfig.inferOptions || {}),
+  },
+};
+
+const runBtn = document.getElementById("runBtn");
+const clearBtn = document.getElementById("clearBtn");
+const inputText = document.getElementById("inputText");
+const statusEl = document.getElementById("status");
+const resultBody = document.getElementById("resultBody");
+const rawJson = document.getElementById("rawJson");
+const mentionCount = document.getElementById("mentionCount");
+const scdCount = document.getElementById("scdCount");
+const bnCount = document.getElementById("bnCount");
+
+let pyodidePromise = null;
+let enginePromise = null;
+
+function setStatus(message, isError = false) {
+  statusEl.textContent = message;
+  statusEl.className = isError ? "status error" : "status";
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function cellValue(item) {
+  if (!item) return "-";
+  return `${item.name} (${item.rxcui})`;
+}
+
+function renderResults(payload) {
+  const mentions = payload.mentions || [];
+  if (!mentions.length) {
+    resultBody.innerHTML = `<tr><td colspan="5">No medication mentions mapped.</td></tr>`;
+  } else {
+    resultBody.innerHTML = mentions
+      .map((m) => {
+        const t = m.tty_results || {};
+        return `
+          <tr>
+            <td>
+              <strong>${escapeHtml(m.mention_text || "")}</strong>
+              <small>${escapeHtml(m.normalized_text || "")}</small>
+            </td>
+            <td>${escapeHtml(cellValue(t.SCD))}</td>
+            <td>${escapeHtml(cellValue(t.SBD))}</td>
+            <td>${escapeHtml(cellValue(t.BN))}</td>
+            <td>${escapeHtml(cellValue(t.IN))}</td>
+          </tr>
+        `;
+      })
+      .join("");
+  }
+
+  mentionCount.textContent = String(mentions.length);
+  scdCount.textContent = String(
+    mentions.filter((m) => m.tty_results && m.tty_results.SCD).length,
+  );
+  bnCount.textContent = String(
+    mentions.filter((m) => m.tty_results && m.tty_results.BN).length,
+  );
+  rawJson.textContent = JSON.stringify(payload, null, 2);
+}
+
+function clearOutput() {
+  resultBody.innerHTML = `<tr><td colspan="5">No results yet.</td></tr>`;
+  rawJson.textContent = "{}";
+  mentionCount.textContent = "0";
+  scdCount.textContent = "0";
+  bnCount.textContent = "0";
+  setStatus("Cleared.");
+}
+
+function joinUrl(base, path) {
+  return `${String(base).replace(/\/+$/, "")}/${String(path).replace(/^\/+/, "")}`;
+}
+
+async function fetchText(url, label) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch ${label}: ${res.status} ${res.statusText}`);
+  }
+  return await res.text();
+}
+
+async function fetchBytes(url, label) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch ${label}: ${res.status} ${res.statusText}`);
+  }
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+async function ensurePyodideScript() {
+  if (typeof window.loadPyodide === "function") {
+    return;
+  }
+  const scriptUrl = joinUrl(CONFIG.pyodideIndexURL, "pyodide.js");
+  await new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = scriptUrl;
+    script.async = true;
+    script.onload = resolve;
+    script.onerror = () => reject(new Error(`Failed to load ${scriptUrl}`));
+    document.head.appendChild(script);
+  });
+}
+
+async function getPyodide() {
+  if (!pyodidePromise) {
+    pyodidePromise = (async () => {
+      setStatus("Loading Python runtime...");
+      await ensurePyodideScript();
+      return await window.loadPyodide({ indexURL: CONFIG.pyodideIndexURL });
+    })().catch((err) => {
+      pyodidePromise = null;
+      throw err;
+    });
+  }
+  return pyodidePromise;
+}
+
+async function initializeEngine() {
+  const py = await getPyodide();
+  py.FS.mkdirTree("/rxnorm");
+  py.FS.mkdirTree("/rxnorm/index");
+
+  setStatus("Downloading inference script...");
+  const mvpScript = await fetchText(CONFIG.mvpScriptUrl, "rxnorm_mvp.py");
+  py.FS.writeFile("/rxnorm/rxnorm_mvp.py", mvpScript);
+
+  setStatus("Downloading SQLite index (this can take a while)...");
+  let sqliteBytes = await fetchBytes(
+    joinUrl(CONFIG.artifactsBaseUrl, "rxnorm_index.sqlite"),
+    "rxnorm_index.sqlite",
+  );
+  py.FS.writeFile("/rxnorm/index/rxnorm_index.sqlite", sqliteBytes);
+  sqliteBytes = null;
+
+  setStatus("Downloading concept embeddings (this can take a while)...");
+  let embBytes = await fetchBytes(
+    joinUrl(CONFIG.artifactsBaseUrl, "concept_embeddings.npy"),
+    "concept_embeddings.npy",
+  );
+  py.FS.writeFile("/rxnorm/index/concept_embeddings.npy", embBytes);
+  embBytes = null;
+
+  setStatus("Downloading concept IDs...");
+  const rxcuiJson = await fetchText(
+    joinUrl(CONFIG.artifactsBaseUrl, "concept_rxcuis.json"),
+    "concept_rxcuis.json",
+  );
+  py.FS.writeFile("/rxnorm/index/concept_rxcuis.json", rxcuiJson);
+
+  setStatus("Initializing inference engine...");
+  await py.runPythonAsync(`
+import importlib.util
+import json
+import sqlite3
+import numpy as np
+
+_spec = importlib.util.spec_from_file_location("rxnorm_mvp", "/rxnorm/rxnorm_mvp.py")
+rxnorm_mvp = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(rxnorm_mvp)
+
+_WEB_CONN = sqlite3.connect("/rxnorm/index/rxnorm_index.sqlite")
+with open("/rxnorm/index/concept_rxcuis.json", "r", encoding="utf-8") as _handle:
+    _WEB_RXCUI_ORDER = json.load(_handle)
+_WEB_EMBEDDINGS = np.load("/rxnorm/index/concept_embeddings.npy")
+_WEB_CONCEPT_TTYS = rxnorm_mvp.load_concept_ttys(_WEB_CONN)
+_WEB_PREFERRED_NAMES = rxnorm_mvp.load_preferred_names(_WEB_CONN)
+_WEB_CANDIDATE_CACHE = {}
+_WEB_INGREDIENT_CACHE = {}
+`);
+}
+
+async function ensureEngine() {
+  if (!enginePromise) {
+    enginePromise = initializeEngine().catch((err) => {
+      enginePromise = null;
+      throw err;
+    });
+  }
+  return await enginePromise;
+}
+
+function runPythonInference(py, text) {
+  const opts = CONFIG.inferOptions;
+  py.globals.set("WEB_INPUT_TEXT", text);
+  return py.runPythonAsync(`
+import json
+_WEB_RESULT = rxnorm_mvp.infer_text_with_resources(
+    input_text=WEB_INPUT_TEXT,
+    conn=_WEB_CONN,
+    embeddings=_WEB_EMBEDDINGS,
+    rxcui_order=_WEB_RXCUI_ORDER,
+    concept_ttys=_WEB_CONCEPT_TTYS,
+    preferred_names=_WEB_PREFERRED_NAMES,
+    top_k=${Number(opts.top_k)},
+    exact_boost=${Number(opts.exact_boost)},
+    max_graph_depth=${Number(opts.max_graph_depth)},
+    max_ngram=${Number(opts.max_ngram)},
+    max_exact_candidates=${Number(opts.max_exact_candidates)},
+    candidate_cache=_WEB_CANDIDATE_CACHE,
+    ingredient_cache=_WEB_INGREDIENT_CACHE,
+)
+json.dumps(_WEB_RESULT)
+`);
+}
+
+async function runInference() {
+  const text = inputText.value.trim();
+  if (!text) {
+    setStatus("Enter text first.", true);
+    return;
+  }
+
+  runBtn.disabled = true;
+  try {
+    const py = await ensureEngine();
+    setStatus("Running inference...");
+    const payloadText = await runPythonInference(py, text);
+    try {
+      py.globals.delete("WEB_INPUT_TEXT");
+    } catch (_err) {
+      // Ignore best-effort cleanup errors.
+    }
+    const payload = JSON.parse(payloadText);
+    renderResults(payload);
+    setStatus("Done.");
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    setStatus(`Inference failed: ${message}`, true);
+  } finally {
+    runBtn.disabled = false;
+  }
+}
+
+runBtn.addEventListener("click", runInference);
+clearBtn.addEventListener("click", clearOutput);

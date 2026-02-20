@@ -21,6 +21,7 @@ class AppConfig:
         infer_script: Path,
         index_dir: Path,
         web_dir: Path,
+        repo_root: Path,
         top_k: int,
         exact_boost: float,
         max_graph_depth: int,
@@ -30,6 +31,7 @@ class AppConfig:
         self.infer_script = infer_script
         self.index_dir = index_dir
         self.web_dir = web_dir
+        self.repo_root = repo_root
         self.top_k = top_k
         self.exact_boost = exact_boost
         self.max_graph_depth = max_graph_depth
@@ -108,7 +110,9 @@ def build_handler(config: AppConfig):
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             if parsed.path == "/":
-                self._serve_file(config.web_dir / "index.html")
+                self.send_response(HTTPStatus.FOUND)
+                self.send_header("Location", "/web/index.html")
+                self.end_headers()
                 return
             if parsed.path == "/health":
                 self._send_json(
@@ -119,6 +123,17 @@ def build_handler(config: AppConfig):
                         "infer_script": str(config.infer_script),
                     },
                 )
+                return
+            if parsed.path == "/rxnorm_mvp.py":
+                self._serve_file(config.repo_root / "rxnorm_mvp.py")
+                return
+            if parsed.path.startswith("/artifacts/rxnorm_mvp/"):
+                rel_path = parsed.path[len("/artifacts/rxnorm_mvp/") :]
+                safe_path = (config.index_dir / rel_path).resolve()
+                if not str(safe_path).startswith(str(config.index_dir.resolve())):
+                    self.send_error(HTTPStatus.FORBIDDEN, "Forbidden")
+                    return
+                self._serve_file(safe_path)
                 return
             if parsed.path.startswith("/web/"):
                 rel_path = parsed.path[len("/web/") :]
@@ -193,6 +208,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    repo_root = Path(".").resolve()
     infer_script = Path(args.infer_script).expanduser().resolve()
     index_dir = Path(args.index_dir).expanduser().resolve()
     web_dir = Path("web").resolve()
@@ -210,6 +226,7 @@ def main() -> int:
         infer_script=infer_script,
         index_dir=index_dir,
         web_dir=web_dir,
+        repo_root=repo_root,
         top_k=args.top_k,
         exact_boost=args.exact_boost,
         max_graph_depth=args.max_graph_depth,

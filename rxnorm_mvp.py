@@ -70,9 +70,19 @@ CONTEXT_STOPWORDS: Set[str] = {
     "for",
     "x7d",
     "x10d",
+    "hfa",
+    "mdi",
+    "inh",
+    "inhaler",
+    "spray",
+    "aerosol",
+    "er",
+    "xr",
+    "ec",
 }
 
 NOISY_TOKEN_REPLACEMENTS: Dict[str, str] = {
+    "losrtan": "losartan",
     "liptor": "lipitor",
     "atorvstatin": "atorvastatin",
     "atorvststin": "atorvastatin",
@@ -683,21 +693,39 @@ def detect_mentions(
 
     mentions.sort(key=lambda item: int(item["start"]))
     if mentions:
-        line_counts: Dict[Tuple[int, int], int] = defaultdict(int)
-        line_boundaries: Dict[int, Tuple[int, int]] = {}
+        line_to_indices: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+        line_bounds: List[Tuple[int, int]] = []
         for idx, mention in enumerate(mentions):
             span_start = int(mention["start"])
             span_end = int(mention["end"])
-            line_start = text.rfind("\n", 0, span_start)
-            line_start = 0 if line_start < 0 else line_start + 1
-            line_end = text.find("\n", span_end)
-            line_end = len(text) if line_end < 0 else line_end
-            key = (line_start, line_end)
-            line_boundaries[idx] = key
-            line_counts[key] += 1
+            bounds = get_line_bounds(text, span_start, span_end)
+            line_bounds.append(bounds)
+            line_to_indices[bounds].append(idx)
+
+        drop_indices: Set[int] = set()
+        for _, indices in line_to_indices.items():
+            if len(indices) < 2:
+                continue
+            for i in indices:
+                span_start = int(mentions[i]["start"])
+                span_end = int(mentions[i]["end"])
+                ttys = set(mentions[i].get("exact_ttys", []))  # type: ignore[arg-type]
+                in_parens = (
+                    0 < span_start < len(text)
+                    and 0 <= span_end < len(text)
+                    and text[span_start - 1] in "(["
+                    and text[span_end] in ")]"
+                )
+                is_brandish = bool(ttys & {"BN", "SBD", "BPCK", "SBDC", "SBDF"})
+                if in_parens or is_brandish:
+                    drop_indices.add(i)
+
+        if drop_indices:
+            mentions = [m for idx, m in enumerate(mentions) if idx not in drop_indices]
+            line_bounds = [b for idx, b in enumerate(line_bounds) if idx not in drop_indices]
 
         for idx, mention in enumerate(mentions):
-            line_start, line_end = line_boundaries[idx]
+            line_start, line_end = line_bounds[idx]
             line_raw = text[line_start:line_end]
             line_stripped = line_raw.strip()
             if not line_stripped:
@@ -842,6 +870,23 @@ def canonical_number(value: str) -> str:
     return f"{parsed:.6g}"
 
 
+def add_strength_signature(signatures: Set[str], value: str, unit: str) -> None:
+    u = canonical_unit(unit)
+    try:
+        numeric = float(value)
+    except ValueError:
+        signatures.add(f"{canonical_number(value)}{u}")
+        return
+
+    signatures.add(f"{canonical_number(str(numeric))}{u}")
+    if u == "mg":
+        mcg_value = numeric * 1000.0
+        signatures.add(f"{canonical_number(str(mcg_value))}mcg")
+    elif u == "mcg":
+        mg_value = numeric / 1000.0
+        signatures.add(f"{canonical_number(str(mg_value))}mg")
+
+
 def collapse_spelled_letters(text: str) -> str:
     tokens = text.split()
     if not tokens:
@@ -869,6 +914,8 @@ def normalize_noisy_text(value: str) -> str:
     if not base:
         return base
     base = collapse_spelled_letters(base)
+    base = re.sub(r"(?<=[a-z])(?=\d)", " ", base)
+    base = re.sub(r"(?<=\d)(?=[a-z])", " ", base)
     base = re.sub(r"\b(\d+)\s*m\s*g\b", r"\1 mg", base)
     base = re.sub(r"\b(\d+)\s*m\s*c\s*g\b", r"\1 mcg", base)
     base = re.sub(r"\b(\d+)\s*m\s*l\b", r"\1 ml", base)
@@ -934,13 +981,15 @@ def build_query_variants(raw_text: str, mention_text: str, mention_norm: str) ->
 
 
 def strength_signatures(text_norm: str) -> Set[str]:
+    working = text_norm.lower()
+    working = re.sub(r"[^a-z0-9./%+\-\s]+", " ", working)
+    working = re.sub(r"\s+", " ", working).strip()
     signatures: Set[str] = set()
-    for first, second, unit in RATIO_STRENGTH_RE.findall(text_norm):
-        u = canonical_unit(unit)
-        signatures.add(f"{canonical_number(first)}{u}")
-        signatures.add(f"{canonical_number(second)}{u}")
-    for value, unit in SINGLE_STRENGTH_RE.findall(text_norm):
-        signatures.add(f"{canonical_number(value)}{canonical_unit(unit)}")
+    for first, second, unit in RATIO_STRENGTH_RE.findall(working):
+        add_strength_signature(signatures, first, unit)
+        add_strength_signature(signatures, second, unit)
+    for value, unit in SINGLE_STRENGTH_RE.findall(working):
+        add_strength_signature(signatures, value, unit)
     return signatures
 
 
@@ -988,8 +1037,8 @@ def focused_context_around_match(full_text: str, match_start: int, match_end: in
 
     focused = line_text[seg_start:seg_end].strip()
     if len(focused) < 3:
-        return normalize_text(line_text.strip())
-    return normalize_text(focused)
+        return normalize_noisy_text(line_text.strip())
+    return normalize_noisy_text(focused)
 
 
 def extract_mention_features(
@@ -1211,7 +1260,7 @@ def score_tty_candidate(
             score -= 0.6
 
     if isinstance(strength_sigs, set) and strength_sigs:
-        candidate_sigs = strength_signatures(candidate_norm)
+        candidate_sigs = strength_signatures(candidate_name)
         if candidate_sigs:
             overlap = len(strength_sigs & candidate_sigs)
             if overlap > 0:
@@ -1239,8 +1288,12 @@ def score_tty_candidate(
             or "injection" in candidate_flags
         ):
             score -= 2.4
+        if "inhaler" in form_tokens and "inhaler" in candidate_flags:
+            score += 2.4
+        if "inhaler" in form_tokens and "inhaler" not in candidate_flags:
+            score -= 3.2
         if "inhaler" in form_tokens and "solution" in candidate_flags and "inhaler" not in candidate_flags:
-            score -= 1.8
+            score -= 2.2
 
         if "injection" in form_tokens and (
             "tablet" in candidate_flags
@@ -1252,6 +1305,13 @@ def score_tty_candidate(
 
         if ("tablet" in form_tokens or "capsule" in form_tokens) and "inhaler" in candidate_flags:
             score -= 2.0
+
+    candidate_flags = candidate_form_flags(candidate_norm)
+    if "solution" in candidate_flags and not (
+        isinstance(form_tokens, set)
+        and any(form in form_tokens for form in {"solution", "inhaler", "injection"})
+    ):
+        score -= 0.9
 
     combo_allowed = combo_hint or len(anchor_ingredients) > 1
     if target_tty == "MIN" and not combo_allowed:
@@ -1369,6 +1429,150 @@ def load_preferred_names(conn: sqlite3.Connection) -> Dict[str, str]:
     return {row[0]: row[1] for row in conn.execute("SELECT rxcui, preferred_name FROM concepts")}
 
 
+def infer_text_with_resources(
+    input_text: str,
+    conn: sqlite3.Connection,
+    embeddings: np.ndarray,
+    rxcui_order: Sequence[str],
+    concept_ttys: Dict[str, Dict[str, str]],
+    preferred_names: Dict[str, str],
+    top_k: int = 40,
+    exact_boost: float = 0.35,
+    max_graph_depth: int = 3,
+    max_ngram: int = 8,
+    max_exact_candidates: int = 25,
+    candidate_cache: Optional[Dict[Tuple[str, str, int], List[Tuple[str, int]]]] = None,
+    ingredient_cache: Optional[Dict[str, Set[str]]] = None,
+) -> Dict[str, object]:
+    mentions = detect_mentions(
+        text=input_text,
+        conn=conn,
+        max_ngram=max_ngram,
+        max_exact_candidates=max_exact_candidates,
+    )
+    results: List[Dict[str, object]] = []
+    if candidate_cache is None:
+        candidate_cache = {}
+    if ingredient_cache is None:
+        ingredient_cache = {}
+
+    for mention in mentions:
+        mention_text = str(mention.get("mention_text", mention["text"]))
+        mention_norm = str(mention["norm_text"])
+        matched_text = str(mention["text"])
+        projection_norm = strip_context_tokens(normalize_noisy_text(matched_text))
+        if not projection_norm:
+            projection_norm = mention_norm
+        mention_start = int(mention.get("mention_start", mention["start"]))
+        mention_end = int(mention.get("mention_end", mention["end"]))
+        match_start = int(mention["start"])
+        match_end = int(mention["end"])
+        line_start, line_end = get_line_bounds(input_text, mention_start, mention_end)
+        line_context = input_text[line_start:line_end].strip()
+        focused_context_norm = focused_context_around_match(
+            input_text, match_start, match_end
+        )
+        if len(focused_context_norm) >= 3:
+            mention_context_norm = focused_context_norm
+        elif len(line_context) >= 4:
+            mention_context_norm = normalize_noisy_text(line_context)
+        else:
+            context_start = max(0, mention_start - 24)
+            context_end = min(len(input_text), mention_end + 40)
+            mention_context_norm = normalize_noisy_text(input_text[context_start:context_end])
+        exact_rxcuids: List[str] = list(mention["exact_rxcuids"])  # type: ignore[assignment]
+        exact_ttys: List[str] = list(mention.get("exact_ttys", []))  # type: ignore[assignment]
+
+        if is_negated_mention(
+            full_text=input_text,
+            span_start=match_start,
+            span_end=match_end,
+            mention_norm=mention_norm,
+        ):
+            continue
+
+        score_by_rxcui: Dict[str, float] = {}
+        query_variants = build_query_variants(
+            raw_text=matched_text,
+            mention_text=mention_text,
+            mention_norm=mention_norm,
+        )
+        for query in query_variants:
+            query_penalty = 0.0 if query == mention_norm else 0.03
+            for rxcui, score in top_embedding_candidates(
+                mention_norm=query,
+                embeddings=embeddings,
+                rxcui_order=rxcui_order,
+                top_k=top_k,
+            ):
+                adjusted = score - query_penalty
+                current = score_by_rxcui.get(rxcui)
+                if current is None or adjusted > current:
+                    score_by_rxcui[rxcui] = adjusted
+
+        for rxcui in exact_rxcuids:
+            score_by_rxcui[rxcui] = score_by_rxcui.get(rxcui, 0.0) + exact_boost
+
+        if not score_by_rxcui:
+            continue
+
+        best_rxcui, best_score = max(score_by_rxcui.items(), key=lambda item: item[1])
+        best_tty_map = concept_ttys.get(best_rxcui, {})
+        best_tty = choose_primary_tty(best_tty_map)
+        projected = project_ttys(
+            start_rxcui=best_rxcui,
+            mention_text=mention_text,
+            mention_norm=projection_norm,
+            mention_context_norm=mention_context_norm,
+            conn=conn,
+            concept_ttys=concept_ttys,
+            max_depth=max_graph_depth,
+            candidate_cache=candidate_cache,
+            ingredient_cache=ingredient_cache,
+        )
+        brand_present = has_brand_evidence(
+            conn=conn,
+            mention_text=mention_text,
+            exact_ttys=exact_ttys,
+            best_tty=best_tty,
+        )
+        if not brand_present:
+            projected["BN"] = None
+            projected["SBD"] = None
+            projected["BPCK"] = None
+
+        results.append(
+            {
+                "mention_text": mention_text,
+                "matched_text": matched_text,
+                "span": {
+                    "start": mention_start,
+                    "end": mention_end,
+                },
+                "matched_span": {
+                    "start": match_start,
+                    "end": match_end,
+                },
+                "normalized_text": mention_norm,
+                "best_match": {
+                    "rxcui": best_rxcui,
+                    "name": preferred_names.get(best_rxcui, ""),
+                    "tty": best_tty,
+                    "score": round(float(best_score), 6),
+                    "exact_match": best_rxcui in exact_rxcuids,
+                },
+                "tty_results": projected,
+            }
+        )
+
+    return {
+        "input_text": input_text,
+        "target_ttys": list(TARGET_TTYS),
+        "mention_count": len(results),
+        "mentions": results,
+    }
+
+
 def cmd_infer(args: argparse.Namespace) -> int:
     index_dir = Path(args.index_dir).expanduser().resolve()
     db_path = index_dir / "rxnorm_index.sqlite"
@@ -1389,7 +1593,10 @@ def cmd_infer(args: argparse.Namespace) -> int:
 
     with rxcui_path.open("r", encoding="utf-8") as handle:
         rxcui_order = json.load(handle)
-    embeddings = np.load(emb_path, mmap_mode="r")
+    try:
+        embeddings = np.load(emb_path, mmap_mode="r")
+    except ValueError:
+        embeddings = np.load(emb_path)
     if int(embeddings.shape[0]) != len(rxcui_order):
         raise ValueError(
             "Embedding row count does not match concept list size: "
@@ -1400,120 +1607,19 @@ def cmd_infer(args: argparse.Namespace) -> int:
     try:
         concept_ttys = load_concept_ttys(conn)
         preferred_names = load_preferred_names(conn)
-
-        mentions = detect_mentions(
-            text=input_text,
+        output = infer_text_with_resources(
+            input_text=input_text,
             conn=conn,
+            embeddings=embeddings,
+            rxcui_order=rxcui_order,
+            concept_ttys=concept_ttys,
+            preferred_names=preferred_names,
+            top_k=args.top_k,
+            exact_boost=args.exact_boost,
+            max_graph_depth=args.max_graph_depth,
             max_ngram=args.max_ngram,
             max_exact_candidates=args.max_exact_candidates,
         )
-        results: List[Dict[str, object]] = []
-        candidate_cache: Dict[Tuple[str, str, int], List[Tuple[str, int]]] = {}
-        ingredient_cache: Dict[str, Set[str]] = {}
-
-        for mention in mentions:
-            mention_text = str(mention.get("mention_text", mention["text"]))
-            mention_norm = str(mention["norm_text"])
-            matched_text = str(mention["text"])
-            mention_start = int(mention.get("mention_start", mention["start"]))
-            mention_end = int(mention.get("mention_end", mention["end"]))
-            match_start = int(mention["start"])
-            match_end = int(mention["end"])
-            line_start, line_end = get_line_bounds(input_text, mention_start, mention_end)
-            line_context = input_text[line_start:line_end].strip()
-            focused_context_norm = focused_context_around_match(
-                input_text, match_start, match_end
-            )
-            if len(focused_context_norm) >= 3:
-                mention_context_norm = focused_context_norm
-            elif len(line_context) >= 4:
-                mention_context_norm = normalize_text(line_context)
-            else:
-                context_start = max(0, mention_start - 24)
-                context_end = min(len(input_text), mention_end + 40)
-                mention_context_norm = normalize_text(input_text[context_start:context_end])
-            exact_rxcuids: List[str] = list(mention["exact_rxcuids"])  # type: ignore[assignment]
-            exact_ttys: List[str] = list(mention.get("exact_ttys", []))  # type: ignore[assignment]
-
-            if is_negated_mention(
-                full_text=input_text,
-                span_start=match_start,
-                span_end=match_end,
-                mention_norm=mention_norm,
-            ):
-                continue
-
-            score_by_rxcui: Dict[str, float] = {}
-
-            for rxcui, score in top_embedding_candidates(
-                mention_norm=mention_norm,
-                embeddings=embeddings,
-                rxcui_order=rxcui_order,
-                top_k=args.top_k,
-            ):
-                score_by_rxcui[rxcui] = score
-
-            for rxcui in exact_rxcuids:
-                score_by_rxcui[rxcui] = score_by_rxcui.get(rxcui, 0.0) + args.exact_boost
-
-            if not score_by_rxcui:
-                continue
-
-            best_rxcui, best_score = max(score_by_rxcui.items(), key=lambda item: item[1])
-            best_tty_map = concept_ttys.get(best_rxcui, {})
-            best_tty = choose_primary_tty(best_tty_map)
-            projected = project_ttys(
-                start_rxcui=best_rxcui,
-                mention_text=mention_text,
-                mention_norm=mention_norm,
-                mention_context_norm=mention_context_norm,
-                conn=conn,
-                concept_ttys=concept_ttys,
-                max_depth=args.max_graph_depth,
-                candidate_cache=candidate_cache,
-                ingredient_cache=ingredient_cache,
-            )
-            brand_present = has_brand_evidence(
-                conn=conn,
-                mention_text=mention_text,
-                exact_ttys=exact_ttys,
-                best_tty=best_tty,
-            )
-            if not brand_present:
-                projected["BN"] = None
-                projected["SBD"] = None
-                projected["BPCK"] = None
-
-            results.append(
-                {
-                    "mention_text": mention_text,
-                    "matched_text": matched_text,
-                    "span": {
-                        "start": mention_start,
-                        "end": mention_end,
-                    },
-                    "matched_span": {
-                        "start": match_start,
-                        "end": match_end,
-                    },
-                    "normalized_text": mention_norm,
-                    "best_match": {
-                        "rxcui": best_rxcui,
-                        "name": preferred_names.get(best_rxcui, ""),
-                        "tty": best_tty,
-                        "score": round(float(best_score), 6),
-                        "exact_match": best_rxcui in exact_rxcuids,
-                    },
-                    "tty_results": projected,
-                }
-            )
-
-        output = {
-            "input_text": input_text,
-            "target_ttys": list(TARGET_TTYS),
-            "mention_count": len(results),
-            "mentions": results,
-        }
         print(json.dumps(output, indent=2))
         return 0
     finally:

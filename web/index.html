@@ -160,7 +160,8 @@
     table {
       width: 100%;
       border-collapse: collapse;
-      min-width: 760px;
+      table-layout: fixed;
+      min-width: 0;
       font-size: 12px;
     }
 
@@ -169,6 +170,19 @@
       border-bottom: 1px solid #e3ece8;
       text-align: left;
       vertical-align: top;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+
+    #resultTable th:nth-child(1),
+    #resultTable td:nth-child(1) {
+      width: 40%;
+    }
+
+    #resultTable th:nth-child(n+2),
+    #resultTable td:nth-child(n+2) {
+      width: 15%;
     }
 
     th {
@@ -179,9 +193,16 @@
       background: #f4faf7;
     }
 
+    td strong {
+      display: block;
+      overflow-wrap: anywhere;
+    }
+
     td small {
       color: var(--subtle);
       display: block;
+      white-space: normal;
+      overflow-wrap: anywhere;
     }
 
     pre {
@@ -234,7 +255,7 @@ Empagliflozin (Jardiance) 10 mg PO daily</textarea>
         <div class="actions">
           <button class="run" id="runBtn">Run Mapping</button>
           <button class="clear" id="clearBtn">Clear Output</button>
-          <span class="status" id="status">Ready.</span>
+          <span class="status" id="status">Ready. First run downloads runtime + index files.</span>
         </div>
       </article>
 
@@ -258,7 +279,6 @@ Empagliflozin (Jardiance) 10 mg PO daily</textarea>
             <thead>
               <tr>
                 <th>Mention</th>
-                <th>Best</th>
                 <th>SCD</th>
                 <th>SBD</th>
                 <th>BN</th>
@@ -266,7 +286,7 @@ Empagliflozin (Jardiance) 10 mg PO daily</textarea>
               </tr>
             </thead>
             <tbody id="resultBody">
-              <tr><td colspan="6">No results yet.</td></tr>
+              <tr><td colspan="5">No results yet.</td></tr>
             </tbody>
           </table>
         </div>
@@ -279,102 +299,6 @@ Empagliflozin (Jardiance) 10 mg PO daily</textarea>
     </section>
   </main>
 
-  <script>
-    const runBtn = document.getElementById("runBtn");
-    const clearBtn = document.getElementById("clearBtn");
-    const inputText = document.getElementById("inputText");
-    const statusEl = document.getElementById("status");
-    const resultBody = document.getElementById("resultBody");
-    const rawJson = document.getElementById("rawJson");
-    const mentionCount = document.getElementById("mentionCount");
-    const scdCount = document.getElementById("scdCount");
-    const bnCount = document.getElementById("bnCount");
-
-    function setStatus(message, isError = false) {
-      statusEl.textContent = message;
-      statusEl.className = isError ? "status error" : "status";
-    }
-
-    function cellValue(item) {
-      if (!item) return "null";
-      return `${item.name} (${item.rxcui})`;
-    }
-
-    function renderResults(payload) {
-      const mentions = payload.mentions || [];
-      if (!mentions.length) {
-        resultBody.innerHTML = `<tr><td colspan="6">No medication mentions mapped.</td></tr>`;
-      } else {
-        resultBody.innerHTML = mentions.map((m) => {
-          const t = m.tty_results || {};
-          const best = m.best_match || {};
-          return `
-            <tr>
-              <td>
-                <strong>${m.mention_text || ""}</strong>
-                <small>${m.normalized_text || ""}</small>
-              </td>
-              <td>
-                ${best.name || "null"}
-                <small>${best.rxcui || ""} ${best.tty || ""}</small>
-              </td>
-              <td>${cellValue(t.SCD)}</td>
-              <td>${cellValue(t.SBD)}</td>
-              <td>${cellValue(t.BN)}</td>
-              <td>${cellValue(t.IN)}</td>
-            </tr>
-          `;
-        }).join("");
-      }
-
-      mentionCount.textContent = String(mentions.length);
-      scdCount.textContent = String(mentions.filter((m) => m.tty_results && m.tty_results.SCD).length);
-      bnCount.textContent = String(mentions.filter((m) => m.tty_results && m.tty_results.BN).length);
-      rawJson.textContent = JSON.stringify(payload, null, 2);
-    }
-
-    async function runInference() {
-      const text = inputText.value.trim();
-      if (!text) {
-        setStatus("Enter text first.", true);
-        return;
-      }
-      setStatus("Running inference...");
-      runBtn.disabled = true;
-
-      try {
-        const res = await fetch("/api/infer", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text })
-        });
-
-        const payload = await res.json();
-        if (!res.ok) {
-          setStatus(payload.error || "Inference failed.", true);
-          return;
-        }
-
-        renderResults(payload);
-        setStatus("Done.");
-      } catch (err) {
-        setStatus("Request failed. Is the local server running?", true);
-      } finally {
-        runBtn.disabled = false;
-      }
-    }
-
-    function clearOutput() {
-      resultBody.innerHTML = `<tr><td colspan="6">No results yet.</td></tr>`;
-      rawJson.textContent = "{}";
-      mentionCount.textContent = "0";
-      scdCount.textContent = "0";
-      bnCount.textContent = "0";
-      setStatus("Cleared.");
-    }
-
-    runBtn.addEventListener("click", runInference);
-    clearBtn.addEventListener("click", clearOutput);
-  </script>
+  <script src="app.js"></script>
 </body>
 </html>
