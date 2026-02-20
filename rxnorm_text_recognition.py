@@ -1536,6 +1536,44 @@ def has_surface_strength_signal(text_norm: str) -> bool:
     return False
 
 
+def has_implicit_numeric_dose_signal(
+    mention_surface_norm: str, mention_features: Dict[str, object]
+) -> bool:
+    if not mention_surface_norm:
+        return False
+    if has_surface_strength_signal(mention_surface_norm):
+        return True
+
+    if bool(mention_features.get("iv_route_hint", False)):
+        return False
+    if bool(mention_features.get("continuous_infusion_hint", False)):
+        return False
+    if re.search(r"\b(?:kg|hr|h|min|sec)\b", mention_surface_norm):
+        return False
+
+    numeric_values: List[float] = []
+    for raw in BARE_NUMBER_RE.findall(mention_surface_norm):
+        try:
+            numeric = float(raw)
+        except ValueError:
+            continue
+        if numeric <= 0.0 or numeric > 1500.0:
+            continue
+        numeric_values.append(numeric)
+    if not numeric_values:
+        return False
+
+    form_tokens = mention_features.get("form_tokens", set())
+    has_oral_form_hint = (
+        isinstance(form_tokens, set)
+        and any(tok in form_tokens for tok in {"tablet", "capsule", "er", "ec", "xl24", "oral"})
+    )
+    schedule_hint = bool(mention_features.get("schedule_hint", False))
+    oral_route_hint = bool(mention_features.get("oral_route_hint", False))
+
+    return schedule_hint or oral_route_hint or has_oral_form_hint
+
+
 def candidate_form_flags(candidate_norm: str) -> Set[str]:
     flags: Set[str] = set()
     padded = f" {candidate_norm} "
@@ -2124,7 +2162,9 @@ def project_ttys(
         mention_text, mention_norm, mention_context_norm
     )
     mention_surface_norm = normalize_noisy_text(mention_text)
-    mention_surface_has_strength = has_surface_strength_signal(mention_surface_norm)
+    mention_surface_has_dose_signal = has_implicit_numeric_dose_signal(
+        mention_surface_norm, mention_features
+    )
     structured_med_record = bool(mention_features.get("structured_med_record", False))
     start_ttys = concept_ttys.get(start_rxcui, {})
     ingredient_anchor = "IN" in start_ttys
@@ -2136,7 +2176,7 @@ def project_ttys(
         if (
             target_tty in {"SCD", "SBD", "SCDC"}
             and ingredient_anchor
-            and not mention_surface_has_strength
+            and not mention_surface_has_dose_signal
             and not structured_med_record
         ):
             continue
