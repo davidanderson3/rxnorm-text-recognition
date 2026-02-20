@@ -1,7 +1,7 @@
 const DEFAULT_CONFIG = {
   pyodideIndexURL: "https://cdn.jsdelivr.net/pyodide/v0.27.3/full/",
-  artifactsBaseUrl: "../artifacts/rxnorm_mvp",
-  mvpScriptUrl: "../rxnorm_mvp.py",
+  artifactsBaseUrl: "../artifacts/rxnorm_index",
+  scriptUrl: "../rxnorm_text_recognition.py",
   inferOptions: {
     top_k: 40,
     exact_boost: 0.35,
@@ -46,13 +46,42 @@ function escapeHtml(value) {
 }
 
 function cellValue(item) {
+  if (Array.isArray(item)) {
+    return item.map((entry) => cellValue(entry)).filter(Boolean).join(" | ");
+  }
   if (!item) return "-";
   return `${item.name} (${item.rxcui})`;
+}
+
+function ttyIdentity(item) {
+  if (!item || typeof item !== "object") return "";
+  if (item.rxcui) return String(item.rxcui);
+  if (item.name) return String(item.name);
+  return "";
+}
+
+function mergeTTYLists(current, candidate) {
+  const merged = [];
+  const seen = new Set();
+  for (const source of [current || [], candidate || []]) {
+    if (!Array.isArray(source)) continue;
+    for (const item of source) {
+      if (!item) continue;
+      const id = ttyIdentity(item);
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      merged.push(item);
+    }
+  }
+  return merged;
 }
 
 function pickBetterTTY(current, candidate) {
   if (!current) return candidate || null;
   if (!candidate) return current;
+  if (Array.isArray(current) || Array.isArray(candidate)) {
+    return mergeTTYLists(current, candidate);
+  }
   const currentDepth =
     typeof current.depth === "number" ? current.depth : Number.POSITIVE_INFINITY;
   const candidateDepth =
@@ -73,6 +102,18 @@ function mergeMentionRows(base, incoming) {
       merged.tty_results[key] || null,
       incomingTTY[key] || null,
     );
+  }
+  merged.tty_results.IN_ALL = mergeTTYLists(
+    merged.tty_results.IN_ALL,
+    incomingTTY.IN_ALL,
+  );
+  if (merged.tty_results.IN_ALL.length) {
+    const inCurrent = merged.tty_results.IN;
+    const inAsList = Array.isArray(inCurrent) ? inCurrent : inCurrent ? [inCurrent] : [];
+    merged.tty_results.IN_ALL = mergeTTYLists(merged.tty_results.IN_ALL, inAsList);
+    merged.tty_results.IN = mergeTTYLists(inAsList, merged.tty_results.IN_ALL);
+  } else if (Array.isArray(merged.tty_results.IN)) {
+    merged.tty_results.IN_ALL = mergeTTYLists(merged.tty_results.IN, []);
   }
 
   const baseNorm = String(merged.normalized_text || "").trim();
@@ -116,6 +157,7 @@ function dedupeMentionsForDisplay(mentions) {
 }
 
 function ttyLine(label, item) {
+  if (Array.isArray(item) && item.length === 0) return "";
   if (!item) return "";
   return `<div class="tty-line"><span class="tty-label">${label}</span> ${escapeHtml(cellValue(item))}</div>`;
 }
@@ -131,7 +173,13 @@ function renderResults(payload) {
       .map((m) => {
         const t = m.tty_results || {};
         const ttyRows = ttyOrder
-          .map((label) => ttyLine(label, t[label]))
+          .map((label) => {
+            const value =
+              label === "IN" && Array.isArray(t.IN_ALL) && t.IN_ALL.length
+                ? t.IN_ALL
+                : t[label];
+            return ttyLine(label, value);
+          })
           .filter(Boolean)
           .join("");
         const ttySection = ttyRows ? `<div class="tty-list">${ttyRows}</div>` : "";
@@ -212,8 +260,8 @@ async function initializeEngine() {
   py.FS.mkdirTree("/rxnorm/index");
 
   setStatus("Downloading inference script...");
-  const mvpScript = await fetchText(CONFIG.mvpScriptUrl, "rxnorm_mvp.py");
-  py.FS.writeFile("/rxnorm/rxnorm_mvp.py", mvpScript);
+  const engineScript = await fetchText(CONFIG.scriptUrl, "rxnorm_text_recognition.py");
+  py.FS.writeFile("/rxnorm/rxnorm_text_recognition.py", engineScript);
 
   setStatus("Downloading SQLite index (this can take a while)...");
   let sqliteBytes = await fetchBytes(
@@ -246,17 +294,17 @@ import sys
 import sqlite3
 import numpy as np
 
-_spec = importlib.util.spec_from_file_location("rxnorm_mvp", "/rxnorm/rxnorm_mvp.py")
-rxnorm_mvp = importlib.util.module_from_spec(_spec)
-sys.modules["rxnorm_mvp"] = rxnorm_mvp
-_spec.loader.exec_module(rxnorm_mvp)
+_spec = importlib.util.spec_from_file_location("rxnorm_engine", "/rxnorm/rxnorm_text_recognition.py")
+rxnorm_engine = importlib.util.module_from_spec(_spec)
+sys.modules["rxnorm_engine"] = rxnorm_engine
+_spec.loader.exec_module(rxnorm_engine)
 
 _WEB_CONN = sqlite3.connect("/rxnorm/index/rxnorm_index.sqlite")
 with open("/rxnorm/index/concept_rxcuis.json", "r", encoding="utf-8") as _handle:
     _WEB_RXCUI_ORDER = json.load(_handle)
 _WEB_EMBEDDINGS = np.load("/rxnorm/index/concept_embeddings.npy")
-_WEB_CONCEPT_TTYS = rxnorm_mvp.load_concept_ttys(_WEB_CONN)
-_WEB_PREFERRED_NAMES = rxnorm_mvp.load_preferred_names(_WEB_CONN)
+_WEB_CONCEPT_TTYS = rxnorm_engine.load_concept_ttys(_WEB_CONN)
+_WEB_PREFERRED_NAMES = rxnorm_engine.load_preferred_names(_WEB_CONN)
 _WEB_CANDIDATE_CACHE = {}
 _WEB_INGREDIENT_CACHE = {}
 `);
@@ -278,7 +326,7 @@ function runPythonInference(py, text) {
   py.globals.set("WEB_INPUT_TEXT", text);
   return py.runPythonAsync(`
 import json
-_WEB_RESULT = rxnorm_mvp.infer_text_with_resources(
+_WEB_RESULT = rxnorm_engine.infer_text_with_resources(
     input_text=WEB_INPUT_TEXT,
     conn=_WEB_CONN,
     embeddings=_WEB_EMBEDDINGS,

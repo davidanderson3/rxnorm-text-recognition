@@ -1,6 +1,6 @@
-# RxNorm Embedding MVP
+# RxNorm Text Recognition
 
-This MVP takes free text, finds medication mentions, picks a best RxNorm concept, and projects to:
+This app takes free text, finds medication mentions, picks a best RxNorm concept, and projects to:
 
 - `SBD`
 - `SCD`
@@ -31,23 +31,23 @@ It uses:
 ## Build index
 
 ```sh
-python3 rxnorm_mvp.py build-index \
+python3 rxnorm_text_recognition.py build-index \
   --rrf-dir RxNorm_full_prescribe_current/rrf \
-  --out-dir artifacts/rxnorm_mvp
+  --out-dir artifacts/rxnorm_index
 ```
 
 Artifacts created:
 
-- `artifacts/rxnorm_mvp/rxnorm_index.sqlite`
-- `artifacts/rxnorm_mvp/concept_embeddings.npy`
-- `artifacts/rxnorm_mvp/concept_rxcuis.json`
-- `artifacts/rxnorm_mvp/metadata.json`
+- `artifacts/rxnorm_index/rxnorm_index.sqlite`
+- `artifacts/rxnorm_index/concept_embeddings.npy`
+- `artifacts/rxnorm_index/concept_rxcuis.json`
+- `artifacts/rxnorm_index/metadata.json`
 
 ## Run inference
 
 ```sh
-python3 rxnorm_mvp.py infer \
-  --index-dir artifacts/rxnorm_mvp \
+python3 rxnorm_text_recognition.py infer \
+  --index-dir artifacts/rxnorm_index \
   --text "Patient takes metformin 500 mg BID and lisinopril 10 mg daily."
 ```
 
@@ -58,11 +58,12 @@ Output is JSON with:
 - `span` and `matched_span`
 - best match (`rxcui`, `name`, `tty`, score)
 - projected results for all target TTYs
+- when a `MIN` is found, `tty_results.IN` contains all ingredient `IN` entries
 
 ## Run the web interface (local)
 
 ```sh
-python3 rxnorm_web.py --index-dir artifacts/rxnorm_mvp --port 8000
+python3 rxnorm_web.py --index-dir artifacts/rxnorm_index --port 8000
 ```
 
 Then open:
@@ -78,9 +79,9 @@ The page now runs inference in-browser via Pyodide (no `/api/infer` call needed)
 Use these flags to test quickly before full indexing:
 
 ```sh
-python3 rxnorm_mvp.py build-index \
+python3 rxnorm_text_recognition.py build-index \
   --rrf-dir RxNorm_full_prescribe_current/rrf \
-  --out-dir artifacts/rxnorm_mvp_smoke \
+  --out-dir artifacts/rxnorm_index_smoke \
   --max-concepts 5000 \
   --max-rel-lines 200000
 ```
