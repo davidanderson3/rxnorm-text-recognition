@@ -85,6 +85,12 @@ TARGET_RELAS: Dict[str, Set[str]] = {
         "tradename_of",
         "has_ingredient",
         "ingredient_of",
+        "has_ingredients",
+        "ingredients_of",
+        "has_part",
+        "part_of",
+        "contains",
+        "contained_in",
         "isa",
         "inverse_isa",
         "has_form",
@@ -99,6 +105,12 @@ TARGET_RELAS: Dict[str, Set[str]] = {
         "tradename_of",
         "has_ingredient",
         "ingredient_of",
+        "has_ingredients",
+        "ingredients_of",
+        "has_part",
+        "part_of",
+        "contains",
+        "contained_in",
         "isa",
         "inverse_isa",
         "has_form",
@@ -147,6 +159,10 @@ TARGET_RELAS: Dict[str, Set[str]] = {
     "IN": {
         "has_ingredient",
         "ingredient_of",
+        "has_tradename",
+        "tradename_of",
+        "consists_of",
+        "constitutes",
         "has_form",
         "form_of",
         "has_precise_ingredient",
@@ -157,6 +173,10 @@ TARGET_RELAS: Dict[str, Set[str]] = {
     "PIN": {
         "has_form",
         "form_of",
+        "has_tradename",
+        "tradename_of",
+        "consists_of",
+        "constitutes",
         "has_precise_ingredient",
         "precise_ingredient_of",
         "has_ingredient",
@@ -167,8 +187,12 @@ TARGET_RELAS: Dict[str, Set[str]] = {
         "part_of",
         "has_ingredients",
         "ingredients_of",
+        "has_ingredient",
+        "ingredient_of",
         "consists_of",
         "constitutes",
+        "contains",
+        "contained_in",
     },
 }
 
@@ -586,7 +610,7 @@ def detect_mentions(
                 continue
 
             rows = conn.execute(
-                "SELECT DISTINCT rxcui FROM alias WHERE norm_text = ? LIMIT ?",
+                "SELECT DISTINCT rxcui, tty FROM alias WHERE norm_text = ? LIMIT ?",
                 (norm_span, max_exact_candidates),
             ).fetchall()
             if not rows:
@@ -603,12 +627,45 @@ def detect_mentions(
                     "start": start,
                     "end": end,
                     "exact_rxcuids": [row[0] for row in rows],
+                    "exact_ttys": sorted({row[1] for row in rows if row[1]}),
                 }
             )
             i += n
 
     mentions.sort(key=lambda item: int(item["start"]))
     if mentions:
+        line_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+        line_boundaries: Dict[int, Tuple[int, int]] = {}
+        for idx, mention in enumerate(mentions):
+            span_start = int(mention["start"])
+            span_end = int(mention["end"])
+            line_start = text.rfind("\n", 0, span_start)
+            line_start = 0 if line_start < 0 else line_start + 1
+            line_end = text.find("\n", span_end)
+            line_end = len(text) if line_end < 0 else line_end
+            key = (line_start, line_end)
+            line_boundaries[idx] = key
+            line_counts[key] += 1
+
+        for idx, mention in enumerate(mentions):
+            line_start, line_end = line_boundaries[idx]
+            line_raw = text[line_start:line_end]
+            line_stripped = line_raw.strip()
+            if not line_stripped:
+                mention["mention_text"] = str(mention["text"])
+                mention["mention_start"] = int(mention["start"])
+                mention["mention_end"] = int(mention["end"])
+                continue
+
+            if line_counts[(line_start, line_end)] == 1:
+                left_trim = len(line_raw) - len(line_raw.lstrip())
+                mention["mention_text"] = line_stripped
+                mention["mention_start"] = line_start + left_trim
+                mention["mention_end"] = line_start + left_trim + len(line_stripped)
+            else:
+                mention["mention_text"] = str(mention["text"])
+                mention["mention_start"] = int(mention["start"])
+                mention["mention_end"] = int(mention["end"])
         return mentions
 
     chunks = [chunk.strip() for chunk in re.split(r"[;\n]+", text) if chunk.strip()]
@@ -626,6 +683,10 @@ def detect_mentions(
                     "start": pos,
                     "end": pos + len(chunk),
                     "exact_rxcuids": [],
+                    "exact_ttys": [],
+                    "mention_text": chunk,
+                    "mention_start": pos,
+                    "mention_end": pos + len(chunk),
                 }
             )
             offset = pos + len(chunk)
@@ -639,6 +700,10 @@ def detect_mentions(
             "start": 0,
             "end": len(stripped),
             "exact_rxcuids": [],
+            "exact_ttys": [],
+            "mention_text": stripped,
+            "mention_start": 0,
+            "mention_end": len(stripped),
         }
     ]
 
