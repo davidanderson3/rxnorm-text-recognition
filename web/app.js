@@ -1,6 +1,6 @@
 const DEFAULT_CONFIG = {
   pyodideIndexURL: "https://cdn.jsdelivr.net/pyodide/v0.27.3/full/",
-  artifactsBaseUrl: "../artifacts/rxnorm_index",
+  artifactsBaseUrl: "../artifacts/rxnorm_mvp",
   scriptUrl: "../rxnorm_text_recognition.py",
   inferOptions: {
     top_k: 40,

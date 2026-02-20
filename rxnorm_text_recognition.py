@@ -1413,12 +1413,24 @@ def should_scan_dense_line(line_text: str) -> bool:
     stripped = line_text.strip()
     if len(stripped) < 70:
         return False
-    if len(stripped.split()) > 4:
-        return False
     canonical = normalize_noisy_text(stripped)
     if len(canonical) < 50:
         return False
-    return len(list(DENSE_LINE_MED_RE.finditer(canonical))) >= 2
+    match_count = len(list(DENSE_LINE_MED_RE.finditer(canonical)))
+    if match_count < 2:
+        return False
+
+    raw_tokens = stripped.split()
+    if len(raw_tokens) <= 4:
+        return True
+
+    mixed_alnum_tokens = sum(
+        1
+        for tok in raw_tokens
+        if re.search(r"[A-Za-z]", tok) and re.search(r"\d", tok)
+    )
+    long_tokens = sum(1 for tok in raw_tokens if len(tok) >= 12)
+    return mixed_alnum_tokens >= 2 or long_tokens >= 3
 
 
 def extract_dense_line_mentions(
@@ -2184,6 +2196,23 @@ def project_ttys(
         min_ingredients = ingredient_set_for_rxcui(
             min_rxcui, conn, concept_ttys, ingredient_cache
         )
+        if len(min_ingredients) < 2:
+            min_name_norm = normalize_noisy_text(str(projected["MIN"]["name"]))
+            part_candidates = re.split(r"\s*(?:/|\+|\band\b)\s*", min_name_norm)
+            for part in part_candidates:
+                part_norm = strip_context_tokens(part)
+                if not part_norm:
+                    continue
+                part_norm = re.sub(r"\b\d+(?:\.\d+)?\b", " ", part_norm)
+                part_norm = re.sub(r"\s+", " ", part_norm).strip()
+                if not part_norm:
+                    continue
+                row = conn.execute(
+                    "SELECT rxcui FROM alias WHERE norm_text = ? AND tty = 'IN' LIMIT 1",
+                    (part_norm,),
+                ).fetchone()
+                if row:
+                    min_ingredients.add(str(row[0]))
         in_all = in_list_from_rxcui_set(min_ingredients, concept_ttys)
         if in_all:
             projected["IN_ALL"] = in_all
