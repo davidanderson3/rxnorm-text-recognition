@@ -223,6 +223,65 @@ async function fetchBytes(url, label) {
   return new Uint8Array(await res.arrayBuffer());
 }
 
+function uniqueList(values) {
+  const seen = new Set();
+  const out = [];
+  for (const value of values) {
+    const key = String(value || "").trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(key);
+  }
+  return out;
+}
+
+async function fetchTextWithFallback(urls, label) {
+  let lastError = null;
+  for (const url of uniqueList(urls)) {
+    try {
+      return await fetchText(url, label);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  const attempted = uniqueList(urls).join(", ");
+  const suffix = lastError && lastError.message ? ` (${lastError.message})` : "";
+  throw new Error(`Failed to fetch ${label} from: ${attempted}${suffix}`);
+}
+
+async function fetchBytesWithFallback(urls, label) {
+  let lastError = null;
+  for (const url of uniqueList(urls)) {
+    try {
+      return await fetchBytes(url, label);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  const attempted = uniqueList(urls).join(", ");
+  const suffix = lastError && lastError.message ? ` (${lastError.message})` : "";
+  throw new Error(`Failed to fetch ${label} from: ${attempted}${suffix}`);
+}
+
+function artifactBaseCandidates() {
+  return uniqueList([
+    CONFIG.artifactsBaseUrl,
+    "../artifacts/rxnorm_mvp",
+    "../artifacts/rxnorm_index",
+    "/artifacts/rxnorm_mvp",
+    "/artifacts/rxnorm_index",
+  ]);
+}
+
+function scriptUrlCandidates() {
+  return uniqueList([
+    CONFIG.scriptUrl,
+    "../rxnorm_text_recognition.py",
+    "/rxnorm_text_recognition.py",
+    "./rxnorm_text_recognition.py",
+  ]);
+}
+
 async function ensurePyodideScript() {
   if (typeof window.loadPyodide === "function") {
     return;
@@ -258,30 +317,34 @@ async function initializeEngine() {
   await py.loadPackage(["numpy", "sqlite3"]);
   py.FS.mkdirTree("/rxnorm");
   py.FS.mkdirTree("/rxnorm/index");
+  const artifactBases = artifactBaseCandidates();
 
   setStatus("Downloading inference script...");
-  const engineScript = await fetchText(CONFIG.scriptUrl, "rxnorm_text_recognition.py");
+  const engineScript = await fetchTextWithFallback(
+    scriptUrlCandidates(),
+    "rxnorm_text_recognition.py",
+  );
   py.FS.writeFile("/rxnorm/rxnorm_text_recognition.py", engineScript);
 
   setStatus("Downloading SQLite index (this can take a while)...");
-  let sqliteBytes = await fetchBytes(
-    joinUrl(CONFIG.artifactsBaseUrl, "rxnorm_index.sqlite"),
+  let sqliteBytes = await fetchBytesWithFallback(
+    artifactBases.map((base) => joinUrl(base, "rxnorm_index.sqlite")),
     "rxnorm_index.sqlite",
   );
   py.FS.writeFile("/rxnorm/index/rxnorm_index.sqlite", sqliteBytes);
   sqliteBytes = null;
 
   setStatus("Downloading concept embeddings (this can take a while)...");
-  let embBytes = await fetchBytes(
-    joinUrl(CONFIG.artifactsBaseUrl, "concept_embeddings.npy"),
+  let embBytes = await fetchBytesWithFallback(
+    artifactBases.map((base) => joinUrl(base, "concept_embeddings.npy")),
     "concept_embeddings.npy",
   );
   py.FS.writeFile("/rxnorm/index/concept_embeddings.npy", embBytes);
   embBytes = null;
 
   setStatus("Downloading concept IDs...");
-  const rxcuiJson = await fetchText(
-    joinUrl(CONFIG.artifactsBaseUrl, "concept_rxcuis.json"),
+  const rxcuiJson = await fetchTextWithFallback(
+    artifactBases.map((base) => joinUrl(base, "concept_rxcuis.json")),
     "concept_rxcuis.json",
   );
   py.FS.writeFile("/rxnorm/index/concept_rxcuis.json", rxcuiJson);

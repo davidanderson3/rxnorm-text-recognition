@@ -21,7 +21,6 @@ class AppConfig:
         infer_script: Path,
         index_dir: Path,
         web_dir: Path,
-        repo_root: Path,
         top_k: int,
         exact_boost: float,
         max_graph_depth: int,
@@ -31,12 +30,17 @@ class AppConfig:
         self.infer_script = infer_script
         self.index_dir = index_dir
         self.web_dir = web_dir
-        self.repo_root = repo_root
         self.top_k = top_k
         self.exact_boost = exact_boost
         self.max_graph_depth = max_graph_depth
         self.max_ngram = max_ngram
         self.max_exact_candidates = max_exact_candidates
+        self.artifact_aliases = {
+            "rxnorm_index",
+            "rxnorm_mvp",
+            "rxnorm_mvp_smoke",
+            index_dir.name,
+        }
 
 
 def run_infer(config: AppConfig, text: str) -> Dict[str, object]:
@@ -125,16 +129,20 @@ def build_handler(config: AppConfig):
                 )
                 return
             if parsed.path == "/rxnorm_text_recognition.py":
-                self._serve_file(config.repo_root / "rxnorm_text_recognition.py")
+                self._serve_file(config.infer_script)
                 return
-            if parsed.path.startswith("/artifacts/rxnorm_index/"):
-                rel_path = parsed.path[len("/artifacts/rxnorm_index/") :]
-                safe_path = (config.index_dir / rel_path).resolve()
-                if not str(safe_path).startswith(str(config.index_dir.resolve())):
-                    self.send_error(HTTPStatus.FORBIDDEN, "Forbidden")
-                    return
-                self._serve_file(safe_path)
-                return
+            if parsed.path.startswith("/artifacts/"):
+                artifact_rel = parsed.path[len("/artifacts/") :]
+                parts = artifact_rel.split("/", 1)
+                if len(parts) == 2:
+                    alias, rel_path = parts
+                    if alias in config.artifact_aliases:
+                        safe_path = (config.index_dir / rel_path).resolve()
+                        if not str(safe_path).startswith(str(config.index_dir.resolve())):
+                            self.send_error(HTTPStatus.FORBIDDEN, "Forbidden")
+                            return
+                        self._serve_file(safe_path)
+                        return
             if parsed.path.startswith("/web/"):
                 rel_path = parsed.path[len("/web/") :]
                 safe_path = (config.web_dir / rel_path).resolve()
@@ -208,7 +216,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    repo_root = Path(".").resolve()
     infer_script = Path(args.infer_script).expanduser().resolve()
     index_dir = Path(args.index_dir).expanduser().resolve()
     web_dir = Path("web").resolve()
@@ -226,7 +233,6 @@ def main() -> int:
         infer_script=infer_script,
         index_dir=index_dir,
         web_dir=web_dir,
-        repo_root=repo_root,
         top_k=args.top_k,
         exact_boost=args.exact_boost,
         max_graph_depth=args.max_graph_depth,
